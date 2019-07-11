@@ -115,13 +115,16 @@ module Xeroizer
         logger.info("Nonce used: " + exception.to_s) if self.logger
         sleep_for(1)
         retry
-      rescue Xeroizer::OAuth::RateLimitExceeded
-        if self.rate_limit_sleep
+      rescue Xeroizer::OAuth::RateLimitExceeded => exception
+        problem = exception.problem
+        problem = "Unknown" if problem.blank?
+        if self.rate_limit_sleep && problem == "Minute"
           raise if attempts > rate_limit_max_attempts
-          logger.info("Rate limit exceeded, retrying") if self.logger
+          logger.info("#{problem} rate limit exceeded, retrying") if self.logger
           sleep_for(self.rate_limit_sleep)
           retry
         else
+          logger.info("#{problem} rate limit exceeded. Not retrying.")
           raise
         end
       end
@@ -144,6 +147,67 @@ module Xeroizer
       end
     end
 
+    def handle_oauth_error!(response)
+      puts response.plain_body
+      error_details = CGI.parse(response.plain_body)
+      description   = error_details["oauth_problem_advice"].first
+      problem = error_details["oauth_problem"].first
+      rate_limit_problem = response["x-rate-limit-problem"]
+      # see http://oauth.pbworks.com/ProblemReporting
+      # In addition to token_expired and token_rejected, Xero also returns
+      # 'rate limit exceeded' when more than 60 requests have been made in
+      # a minute, or more than 5000 requests have been made in a day.
+      if problem
+        case problem
+          when "token_expired"                then raise OAuth::TokenExpired.new(description)
+          when "token_rejected"               then raise OAuth::TokenInvalid.new(description)
+          when "rate limit exceeded"          then raise OAuth::RateLimitExceeded.new("#{rate_limit_problem} #{problem}. #{description}", rate_limit_problem)
+          when "consumer_key_unknown"         then raise OAuth::ConsumerKeyUnknown.new(description)
+          when "nonce_used"                   then raise OAuth::NonceUsed.new(description)
+          when "organisation offline"         then raise OAuth::OrganisationOffline.new(description)
+          else raise OAuth::UnknownError.new(problem + ':' + description)
+        end
+      else
+        raise OAuth::UnknownError.new("Xero API may be down or the way OAuth errors are provided by Xero may have changed.")
+      end
+    end
+
+    def handle_error!(response, request_body)
+
+      raw_response = response.plain_body
+
+      # XeroGenericApplication API Exceptions *claim* to be UTF-16 encoded, but fail REXML/Iconv parsing...
+      # So let's ignore that :)
+      raw_response.gsub! '<?xml version="1.0" encoding="utf-16"?>', ''
+
+      # doc = REXML::Document.new(raw_response, :ignore_whitespace_nodes => :all)
+      doc = Nokogiri::XML(raw_response)
+
+      if doc && doc.root && doc.root.name == "ApiException"
+
+        raise ApiException.new(doc.root.xpath("Type").text,
+                               doc.root.xpath("Message").text,
+                               raw_response,
+                               doc,
+                               request_body)
+
+      else
+        raise BadResponse.new("Unparseable 400 Response: #{raw_response}")
+      end
+    end
+
+    def handle_object_not_found!(response, request_url)
+      case request_url
+        when /Invoices/ then raise InvoiceNotFoundError.new("Invoice not found in Xero.")
+        when /CreditNotes/ then raise CreditNoteNotFoundError.new("Credit Note not found in Xero.")
+        else raise ObjectNotFound.new(request_url)
+      end
+    end
+
+    def handle_unknown_response_error!(response)
+      raise BadResponse.new("Unknown response code: #{response.code.to_i}")
+    end
+
     def sleep_for(seconds = 1)
       sleep seconds
     end
@@ -155,6 +219,5 @@ module Xeroizer
       models = [/Invoices/, /CreditNotes/, /BankTransactions/, /Receipts/, /Items/, /Overpayments/, /Prepayments/]
       self.unitdp == 4 && models.any?{ |m| request_url =~ m } ? {:unitdp => 4} : {}
     end
-
-  end
+  end 
 end

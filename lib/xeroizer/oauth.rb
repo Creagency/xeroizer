@@ -42,6 +42,15 @@ module Xeroizer
 
       attr_reader :retry_after, :daily_limit_remaining
     end
+#    class RateLimitExceeded < OAuthError
+#      def initialize(message, problem=nil)
+#        super(message)
+#        @problem = problem
+#      end
+#      def problem
+#        @problem
+#      end
+#    end
 
     unless defined? XERO_CONSUMER_OPTIONS
       XERO_CONSUMER_OPTIONS = {
